@@ -1,0 +1,23 @@
+{
+  "pins" : [
+    {
+      "identity" : "swift-concurrency-extras",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/pointfreeco/swift-concurrency-extras.git",
+      "state" : {
+        "revision" : "5a3825302b1a0d744183200915a47b508c828e6f",
+        "version" : "1.3.2"
+      }
+    },
+    {
+      "identity" : "swift-tracing",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/grdsdev/swift-tracing.git",
+      "state" : {
+        "revision" : "a9799c0e6988a3bd011a38c87b90180175142f97",
+        "version" : "0.1.0"
+      }
+    }
+  ],
+  "version" : 2
+}
