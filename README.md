@@ -121,7 +121,6 @@ tracer.forceFlush()
 ## Dependencies
 
 - [swift-tracing](https://github.com/grdsdev/swift-tracing)
-- [swift-concurrency-extras](https://github.com/pointfreeco/swift-concurrency-extras)
 
 ## License
 

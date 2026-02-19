@@ -3,7 +3,6 @@
 //  TracingLogflare
 //
 
-import ConcurrencyExtras
 import Foundation
 import Tracing
 
@@ -40,12 +39,9 @@ public final class LogflareTracer: Tracer, @unchecked Sendable {
 
   private let configuration: LogflareConfiguration
   private let urlSession: URLSession
-  private let mutableState = LockIsolated(MutableState())
-
-  private struct MutableState {
-    var spanBuffer: [CompletedSpan] = []
-    var flushTimer: Timer?
-  }
+  private let lock = NSLock()
+  private var spanBuffer: [CompletedSpan] = []
+  private var flushTimer: Timer?
 
   public init(
     configuration: LogflareConfiguration,
@@ -82,9 +78,11 @@ public final class LogflareTracer: Tracer, @unchecked Sendable {
     )
   }
 
-  private func forceFlush(mutableState: inout MutableState) {
-    let spans = mutableState.spanBuffer
-    mutableState.spanBuffer.removeAll()
+  public func forceFlush() {
+    lock.lock()
+    let spans = spanBuffer
+    spanBuffer.removeAll()
+    lock.unlock()
 
     guard !spans.isEmpty else { return }
 
@@ -97,29 +95,22 @@ public final class LogflareTracer: Tracer, @unchecked Sendable {
     }
   }
 
-  public func forceFlush() {
-    mutableState.withValue {
-      forceFlush(mutableState: &$0)
-    }
-  }
-
   private func startPeriodicFlush() {
-    mutableState.withValue {
-      $0.flushTimer =
-        Timer.scheduledTimer(
-          withTimeInterval: configuration.flushInterval,
-          repeats: true
-        ) { [weak self] _ in
-          self?.forceFlush()
-        }
+    lock.lock()
+    flushTimer = Timer.scheduledTimer(
+      withTimeInterval: configuration.flushInterval,
+      repeats: true
+    ) { [weak self] _ in
+      self?.forceFlush()
     }
+    lock.unlock()
   }
 
   private func recordSpan(_ span: CompletedSpan) {
-    let shouldFlush = mutableState.withValue {
-      $0.spanBuffer.append(span)
-      return $0.spanBuffer.count >= configuration.batchSize
-    }
+    lock.lock()
+    spanBuffer.append(span)
+    let shouldFlush = spanBuffer.count >= configuration.batchSize
+    lock.unlock()
 
     if shouldFlush {
       forceFlush()
@@ -205,19 +196,14 @@ public final class LogflareTracer: Tracer, @unchecked Sendable {
   }
 
   deinit {
-    mutableState.withValue { state in
-      state.flushTimer?.invalidate()
-      state.flushTimer = nil
+    lock.lock()
+    flushTimer?.invalidate()
+    flushTimer = nil
+    spanBuffer.removeAll()
+    lock.unlock()
 
-      // Flush remaining spans synchronously
-      let spans = state.spanBuffer
-      state.spanBuffer.removeAll()
-
-      guard !spans.isEmpty else { return }
-
-      // Note: We cannot perform async operations in deinit
-      // Remaining spans will be lost if not flushed before deallocation
-    }
+    // Note: We cannot perform async operations in deinit
+    // Remaining spans will be lost if not flushed before deallocation
   }
 }
 
@@ -234,16 +220,13 @@ public final class LogflareSpan: SpanProtocol, @unchecked Sendable {
   private let kind: SpanKind
   private let onEnd: @Sendable (CompletedSpan) -> Void
   private let startTime: Date
+  private let lock = NSLock()
 
-  private struct MutableState {
-    var operationName: String
-    var attributes: SpanAttributes = SpanAttributes()
-    var status: SpanStatus?
-    var error: (any Error)?
-    var isRecording = true
-  }
-
-  private let mutableState: LockIsolated<MutableState>
+  private var _operationName: String
+  private var _attributes: SpanAttributes = SpanAttributes()
+  private var _status: SpanStatus?
+  private var _error: (any Error)?
+  private var _isRecording = true
 
   fileprivate init(
     operationName: String,
@@ -255,26 +238,38 @@ public final class LogflareSpan: SpanProtocol, @unchecked Sendable {
     self.kind = kind
     self.startTime = Date()
     self.onEnd = onEnd
-    self.mutableState = LockIsolated(
-      MutableState(operationName: operationName)
-    )
+    self._operationName = operationName
   }
 
   public var operationName: String {
-    mutableState.withValue { $0.operationName }
+    lock.lock()
+    defer { lock.unlock() }
+    return _operationName
   }
 
   public var attributes: SpanAttributes {
-    get { mutableState.withValue { $0.attributes } }
-    set { mutableState.withValue { $0.attributes = newValue } }
+    get {
+      lock.lock()
+      defer { lock.unlock() }
+      return _attributes
+    }
+    set {
+      lock.lock()
+      _attributes = newValue
+      lock.unlock()
+    }
   }
 
   public var isRecording: Bool {
-    mutableState.withValue { $0.isRecording }
+    lock.lock()
+    defer { lock.unlock() }
+    return _isRecording
   }
 
   public func setStatus(_ status: SpanStatus) {
-    mutableState.withValue { $0.status = status }
+    lock.lock()
+    _status = status
+    lock.unlock()
   }
 
   public func addEvent(_ event: SpanEvent) {
@@ -286,11 +281,11 @@ public final class LogflareSpan: SpanProtocol, @unchecked Sendable {
     attributes: SpanAttributes,
     at instant: (any TracerInstant)?
   ) {
-    mutableState.withValue {
-      $0.error = error
-      $0.status = .error(message: String(describing: error))
-      $0.attributes.merge(attributes)
-    }
+    lock.lock()
+    _error = error
+    _status = .error(message: String(describing: error))
+    _attributes.merge(attributes)
+    lock.unlock()
   }
 
   public func addLink(_ context: SpanContext) {
@@ -298,27 +293,28 @@ public final class LogflareSpan: SpanProtocol, @unchecked Sendable {
   }
 
   public func end(at instant: (any TracerInstant)?) {
-    let completed = mutableState.withValue { state -> CompletedSpan? in
-      guard state.isRecording else { return nil }
-      state.isRecording = false
-
-      let endTime = Date()
-      let durationMs = Int64(endTime.timeIntervalSince(startTime) * 1000)
-
-      return CompletedSpan(
-        operationName: state.operationName,
-        context: context,
-        kind: kind,
-        status: state.status,
-        durationMs: durationMs,
-        attributes: state.attributes,
-        error: state.error
-      )
+    lock.lock()
+    guard _isRecording else {
+      lock.unlock()
+      return
     }
+    _isRecording = false
 
-    if let completed {
-      onEnd(completed)
-    }
+    let endTime = Date()
+    let durationMs = Int64(endTime.timeIntervalSince(startTime) * 1000)
+
+    let completed = CompletedSpan(
+      operationName: _operationName,
+      context: context,
+      kind: kind,
+      status: _status,
+      durationMs: durationMs,
+      attributes: _attributes,
+      error: _error
+    )
+    lock.unlock()
+
+    onEnd(completed)
   }
 }
 
